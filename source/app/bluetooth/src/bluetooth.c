@@ -1,3 +1,7 @@
+/*******************************************************************************
+ * Includes
+ ******************************************************************************/
+
 #include "bluetooth.h"
 
 #include "error.h"
@@ -6,213 +10,764 @@
 #include <esp_bt.h>
 #include <esp_bt_defs.h>
 #include <esp_bt_main.h>
-#include <esp_bt_device.h>
 #include <esp_gap_ble_api.h>
-#include <esp_gatts_api.h>
 #include <esp_gatt_defs.h>
+#include <esp_gatts_api.h>
+#include <esp_hid_common.h>
 #include <esp_hidd.h>
-#include <esp_hid_gap.h>
 #include <esp_log.h>
 
 #include <freertos/FreeRTOS.h>
-#include <freertos/event_groups.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
+#include <inttypes.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 /*******************************************************************************
  * Definitions
  ******************************************************************************/
 
-#define BT_TASK_PRIORITY   (3)
-#define BT_TASK_STACK_SIZE (8192)
-#define BT_TASK_DELAY_MS   (50)
-
 #define BT_MODE_BLE (0x01)
+
+/* Uncomment to print all devices that were seen during a scan. */
+#define GAP_DBG_PRINTF(...) /* printf(__VA_ARGS__). */
+
+/*******************************************************************************
+ * Types
+ ******************************************************************************/
+
+typedef struct bt_hid_scan_result_s
+{
+    struct bt_hid_scan_result_s* next;
+
+    esp_bd_addr_t       bda;
+    const char*         name;
+    int8_t              rssi;
+    esp_hid_usage_t     usage;
+    esp_hid_transport_t transport;
+
+    struct
+    {
+        esp_ble_addr_type_t addr_type;
+        uint16_t            appearance;
+    } ble;
+} bt_hid_scan_result_t;
 
 typedef struct
 {
-    TaskHandle_t task_hdl;
-    esp_hidd_dev_t *hid_dev;
-    uint8_t protocol_mode;
-    uint8_t *buffer;
-} local_param_t;
+    TaskHandle_t    task_hdl;
+    esp_hidd_dev_t* hid_dev;
+    uint8_t         protocol_mode;
+    uint8_t*        buffer;
+} bt_local_param_t;
+
+/*******************************************************************************
+ * Private function prototypes
+ ******************************************************************************/
+
+static void bt_ble_adv_start(void);
+static void bt_ble_cb_send(void);
+static esp_err_t bt_ble_gap_adv_init(uint16_t appearance, const char* device_name);
+static esp_err_t bt_ble_gap_init(void);
+static void bt_ble_gap_event_handle(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param);
+static void bt_ble_scan_result_add(esp_bd_addr_t bda,
+                                  esp_ble_addr_type_t addr_type,
+                                  uint16_t appearance,
+                                  uint8_t* name,
+                                  uint8_t name_len,
+                                  int rssi);
+static void bt_ble_task_demo(void* pv_parameters);
+static void bt_ble_task_start(void);
+static void bt_ble_task_stop(void);
+static void bt_device_result_handle(struct ble_scan_result_evt_param* scan_rst);
+static void bt_hidd_event_callback(void* handler_args, esp_event_base_t base, int32_t id, void* event_data);
+static esp_err_t bt_low_level_init(uint8_t mode);
+static void bt_mouse_send(uint8_t buttons, char dx, char dy, char wheel);
+static bt_hid_scan_result_t* bt_scan_result_find(esp_bd_addr_t bda, bt_hid_scan_result_t* results);
+static const char* bt_str_ble_key_type(esp_ble_key_type_t key_type);
 
 /*******************************************************************************
  * Data
  ******************************************************************************/
 
-const unsigned char hidapiReportMap[] = {
-    0x05, 0x01,        // USAGE_PAGE (Generic Desktop)
-    0x09, 0x02,        // USAGE (Mouse)
-    0xA1, 0x01,        // COLLECTION (Application)
-    0x85, 0x01,        //   REPORT_ID (1)
-    0x09, 0x01,        //   USAGE (Pointer)
-    0xA1, 0x00,        //   COLLECTION (Physical)
-    // ------------------------------------------------- Buttons (Left, Right, Middle, Back, Forward)
-    0x05, 0x09,        //     USAGE_PAGE (Button)
-    0x19, 0x01,        //     USAGE_MINIMUM (Button 1)
-    0x29, 0x05,        //     USAGE_MAXIMUM (Button 5)
-    0x15, 0x00,        //     LOGICAL_MINIMUM (0)
-    0x25, 0x01,        //     LOGICAL_MAXIMUM (1)
-    0x75, 0x01,        //     REPORT_SIZE (1)
-    0x95, 0x05,        //     REPORT_COUNT (5)
-    0x81, 0x02,        //     INPUT (Data, Variable, Absolute) ;5 button bits
-    // ------------------------------------------------- Padding
-    0x75, 0x03,        //     REPORT_SIZE (3)
-    0x95, 0x01,        //     REPORT_COUNT (1)
-    0x81, 0x03,        //     INPUT (Constant, Variable, Absolute) ;3 bit padding
-    // ------------------------------------------------- X/Y position, Wheel
-    0x05, 0x01,        //     USAGE_PAGE (Generic Desktop)
-    0x09, 0x30,        //     USAGE (X)
-    0x09, 0x31,        //     USAGE (Y)
-    0x09, 0x38,        //     USAGE (Wheel)
-    0x15, 0x81,        //     LOGICAL_MINIMUM (-127)
-    0x25, 0x7F,        //     LOGICAL_MAXIMUM (127)
-    0x75, 0x08,        //     REPORT_SIZE (8)
-    0x95, 0x03,        //     REPORT_COUNT (3)
-    0x81, 0x06,        //     INPUT (Data, Variable, Relative) ;3 bytes (X,Y,Wheel)
-    // ------------------------------------------------- Horizontal wheel
-    0x05, 0x0C,        //     USAGE_PAGE (Consumer Devices)
-    0x0A, 0x38, 0x02,  //     USAGE (AC Pan)
-    0x15, 0x81,        //     LOGICAL_MINIMUM (-127)
-    0x25, 0x7F,        //     LOGICAL_MAXIMUM (127)
-    0x75, 0x08,        //     REPORT_SIZE (8)
-    0x95, 0x01,        //     REPORT_COUNT (1)
-    0x81, 0x06,        //     INPUT (Data, Var, Rel)
-    0xC0,              //   END_COLLECTION
-    0xC0               // END_COLLECTION
+static const char* bt_tag = "BT";
+
+static SemaphoreHandle_t bt_ble_hidh_cb_semaphore = NULL;
+
+static bt_hid_scan_result_t* bt_ble_scan_results = NULL;
+static size_t                bt_num_ble_scan_results = 0;
+
+static bt_local_param_t bt_ble_hid_param = {0};
+
+static const unsigned char bt_hidapi_report_map[] =
+{
+    0x05, 0x01,        /* USAGE_PAGE (Generic Desktop). */
+    0x09, 0x02,        /* USAGE (Mouse). */
+    0xA1, 0x01,        /* COLLECTION (Application). */
+    0x85, 0x01,        /* REPORT_ID (1). */
+    0x09, 0x01,        /* USAGE (Pointer). */
+    0xA1, 0x00,        /* COLLECTION (Physical). */
+
+    /* Buttons (Left, Right, Middle, Back, Forward). */
+    0x05, 0x09,        /* USAGE_PAGE (Button). */
+    0x19, 0x01,        /* USAGE_MINIMUM (Button 1). */
+    0x29, 0x05,        /* USAGE_MAXIMUM (Button 5). */
+    0x15, 0x00,        /* LOGICAL_MINIMUM (0). */
+    0x25, 0x01,        /* LOGICAL_MAXIMUM (1). */
+    0x75, 0x01,        /* REPORT_SIZE (1). */
+    0x95, 0x05,        /* REPORT_COUNT (5). */
+    0x81, 0x02,        /* INPUT (Data, Variable, Absolute) ;5 button bits. */
+
+    /* Padding. */
+    0x75, 0x03,        /* REPORT_SIZE (3). */
+    0x95, 0x01,        /* REPORT_COUNT (1). */
+    0x81, 0x03,        /* INPUT (Constant, Variable, Absolute) ;3 bit padding. */
+
+    /* X/Y position, Wheel. */
+    0x05, 0x01,        /* USAGE_PAGE (Generic Desktop). */
+    0x09, 0x30,        /* USAGE (X). */
+    0x09, 0x31,        /* USAGE (Y). */
+    0x09, 0x38,        /* USAGE (Wheel). */
+    0x15, 0x81,        /* LOGICAL_MINIMUM (-127). */
+    0x25, 0x7F,        /* LOGICAL_MAXIMUM (127). */
+    0x75, 0x08,        /* REPORT_SIZE (8). */
+    0x95, 0x03,        /* REPORT_COUNT (3). */
+    0x81, 0x06,        /* INPUT (Data, Variable, Relative) ;3 bytes (X,Y,Wheel). */
+
+    /* Horizontal wheel. */
+    0x05, 0x0C,        /* USAGE_PAGE (Consumer Devices). */
+    0x0A, 0x38, 0x02,  /* USAGE (AC Pan). */
+    0x15, 0x81,        /* LOGICAL_MINIMUM (-127). */
+    0x25, 0x7F,        /* LOGICAL_MAXIMUM (127). */
+    0x75, 0x08,        /* REPORT_SIZE (8). */
+    0x95, 0x01,        /* REPORT_COUNT (1). */
+    0x81, 0x06,        /* INPUT (Data, Var, Rel). */
+
+    0xC0,              /* END_COLLECTION. */
+    0xC0               /* END_COLLECTION. */
 };
 
-static esp_hid_raw_report_map_t bt_ble_report_maps[] = {
+static esp_hid_raw_report_map_t bt_ble_report_maps[] =
+{
     {
-        .data = hidapiReportMap,
-        .len = sizeof(hidapiReportMap)
+        .data = bt_hidapi_report_map,
+        .len  = sizeof(bt_hidapi_report_map),
     }
 };
 
 static esp_hid_device_config_t bt_ble_hid_config =
 {
-    .vendor_id          = 0x16C0,
-    .product_id         = 0x05DF,
-    .version            = 0x0100,
-    .device_name        = "burgiclab HID",
-    .manufacturer_name  = "burgiclab",
-    .serial_number      = "0000000001",
-    .report_maps        = bt_ble_report_maps,
-    .report_maps_len    = 1
+    .vendor_id         = 0x16C0,
+    .product_id        = 0x05DF,
+    .version           = 0x0100,
+    .device_name       = "burgiclab HID",
+    .manufacturer_name = "burgiclab",
+    .serial_number     = "0000000001",
+    .report_maps       = bt_ble_report_maps,
+    .report_maps_len   = 1,
 };
 
-static local_param_t bt_ble_hid_param = {0};
-
 /*******************************************************************************
- * Internal functions
+ * Private functions
  ******************************************************************************/
 
-static void send_mouse(uint8_t buttons, char dx, char dy, char wheel)
+static void bt_ble_adv_start(void)
 {
-    static uint8_t buffer[5] = {0};
-    buffer[0] = buttons;
-    buffer[1] = dx;
-    buffer[2] = dy;
-    buffer[3] = wheel;
-    buffer[4] = 0;
-    esp_hidd_dev_input_set(bt_ble_hid_param.hid_dev, 0, 1, buffer, 5);
+    static esp_ble_adv_params_t bt_hidd_adv_params =
+    {
+        .adv_int_min       = 0x20,
+        .adv_int_max       = 0x30,
+        .adv_type          = ADV_TYPE_IND,
+        .own_addr_type     = BLE_ADDR_TYPE_PUBLIC,
+        .channel_map       = ADV_CHNL_ALL,
+        .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    };
+
+    (void)esp_ble_gap_start_advertising(&bt_hidd_adv_params);
 }
 
-static void ble_hid_demo_task(void *pvParameters)
+static void bt_ble_cb_send(void)
+{
+    (void)xSemaphoreGive(bt_ble_hidh_cb_semaphore);
+}
+
+static esp_err_t bt_ble_gap_adv_init(uint16_t appearance, const char* device_name)
+{
+    esp_err_t ret;
+
+    static const uint8_t bt_hidd_service_uuid128[] =
+    {
+        0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+        0x00, 0x10, 0x00, 0x00, 0x12, 0x18, 0x00, 0x00,
+    };
+
+    static uint8_t bt_manufacturer_data[] = { 0xE5, 0x02 };
+
+    esp_ble_adv_data_t ble_adv_data =
+    {
+        .set_scan_rsp        = false,
+        .include_name        = false,
+        .include_txpower     = true,
+        .min_interval        = 0x0006,
+        .max_interval        = 0x0010,
+        .appearance          = appearance,
+        .manufacturer_len    = 0,
+        .p_manufacturer_data = NULL,
+        .service_data_len    = 0,
+        .p_service_data      = NULL,
+        .service_uuid_len    = sizeof(bt_hidd_service_uuid128),
+        .p_service_uuid      = (uint8_t*)bt_hidd_service_uuid128,
+        .flag                = ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT,
+    };
+
+    esp_ble_adv_data_t ble_scan_rsp_data =
+    {
+        .set_scan_rsp        = true,
+        .include_name        = true,
+        .include_txpower     = false,
+        .manufacturer_len    = sizeof(bt_manufacturer_data),
+        .p_manufacturer_data = (uint8_t*)bt_manufacturer_data,
+        .service_data_len    = 0,
+        .p_service_data      = NULL,
+        .service_uuid_len    = 0,
+        .p_service_uuid      = NULL,
+        .flag                = 0,
+    };
+
+    /* Configure security parameters. */
+    esp_ble_auth_req_t auth_req = ESP_IO_CAP_NONE;
+    esp_ble_io_cap_t   iocap = ESP_IO_CAP_NONE;
+    uint8_t            init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t            rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t            key_size = 16;
+    uint32_t           passkey = 1234;
+
+    ret = esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, 1);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(bt_tag, "GAP set_security_param AUTHEN_REQ_MODE failed: %d", ret);
+        return ret;
+    }
+
+    ret = esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, 1);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(bt_tag, "GAP set_security_param IOCAP_MODE failed: %d", ret);
+        return ret;
+    }
+
+    ret = esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, 1);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(bt_tag, "GAP set_security_param SET_INIT_KEY failed: %d", ret);
+        return ret;
+    }
+
+    ret = esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, 1);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(bt_tag, "GAP set_security_param SET_RSP_KEY failed: %d", ret);
+        return ret;
+    }
+
+    ret = esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, 1);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(bt_tag, "GAP set_security_param MAX_KEY_SIZE failed: %d", ret);
+        return ret;
+    }
+
+    ret = esp_ble_gap_set_security_param(ESP_BLE_SM_SET_STATIC_PASSKEY, &passkey, sizeof(uint32_t));
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(bt_tag, "GAP set_security_param SET_STATIC_PASSKEY failed: %d", ret);
+        return ret;
+    }
+
+    ret = esp_ble_gap_set_device_name(device_name);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(bt_tag, "GAP set_device_name failed: %d", ret);
+        return ret;
+    }
+
+    ret = esp_ble_gap_config_adv_data(&ble_adv_data);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(bt_tag, "GAP config_adv_data failed: %d", ret);
+        return ret;
+    }
+
+    ret = esp_ble_gap_config_adv_data(&ble_scan_rsp_data);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(bt_tag, "GAP config_adv_data failed: %d", ret);
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t bt_ble_gap_init(void)
+{
+    esp_err_t ret = esp_ble_gap_register_callback(bt_ble_gap_event_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(bt_tag, "esp_ble_gap_register_callback failed: %d", ret);
+        return ret;
+    }
+
+    return ret;
+}
+
+static void bt_ble_gap_event_handle(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param)
+{
+    switch (event)
+    {
+        case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
+        {
+            ESP_LOGV(bt_tag, "BLE GAP EVENT SCAN_PARAM_SET_COMPLETE");
+            bt_ble_cb_send();
+            break;
+        }
+
+        case ESP_GAP_BLE_SCAN_RESULT_EVT:
+        {
+            esp_ble_gap_cb_param_t* scan_result = (esp_ble_gap_cb_param_t*)param;
+
+            switch (scan_result->scan_rst.search_evt)
+            {
+                case ESP_GAP_SEARCH_INQ_RES_EVT:
+                {
+                    bt_device_result_handle(&scan_result->scan_rst);
+                    break;
+                }
+
+                case ESP_GAP_SEARCH_INQ_CMPL_EVT:
+                {
+                    ESP_LOGV(bt_tag, "BLE GAP EVENT SCAN DONE: %d", scan_result->scan_rst.num_resps);
+                    bt_ble_cb_send();
+                    break;
+                }
+
+                default:
+                    break;
+            }
+            break;
+        }
+
+        case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
+        {
+            ESP_LOGV(bt_tag, "BLE GAP EVENT SCAN CANCELED");
+            break;
+        }
+
+        case ESP_GAP_BLE_AUTH_CMPL_EVT:
+        {
+            if (!param->ble_security.auth_cmpl.success)
+            {
+                ESP_LOGE(bt_tag, "BLE GAP AUTH ERROR: 0x%x", param->ble_security.auth_cmpl.fail_reason);
+            }
+            else
+            {
+                ESP_LOGI(bt_tag, "BLE GAP AUTH SUCCESS");
+            }
+            break;
+        }
+
+        case ESP_GAP_BLE_KEY_EVT:
+        {
+            ESP_LOGI(bt_tag, "BLE GAP KEY type = %s", bt_str_ble_key_type(param->ble_security.ble_key.key_type));
+            break;
+        }
+
+        case ESP_GAP_BLE_PASSKEY_NOTIF_EVT:
+        {
+            ESP_LOGI(bt_tag, "BLE GAP PASSKEY_NOTIF passkey:%" PRIu32, param->ble_security.key_notif.passkey);
+            break;
+        }
+
+        case ESP_GAP_BLE_NC_REQ_EVT:
+        {
+            ESP_LOGI(bt_tag, "BLE GAP NC_REQ passkey:%" PRIu32, param->ble_security.key_notif.passkey);
+            esp_ble_confirm_reply(param->ble_security.key_notif.bd_addr, true);
+            break;
+        }
+
+        case ESP_GAP_BLE_PASSKEY_REQ_EVT:
+        {
+            ESP_LOGI(bt_tag, "BLE GAP PASSKEY_REQ");
+            break;
+        }
+
+        case ESP_GAP_BLE_SEC_REQ_EVT:
+        {
+            ESP_LOGI(bt_tag, "BLE GAP SEC_REQ");
+            esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+static void bt_ble_scan_result_add(esp_bd_addr_t bda,
+                                  esp_ble_addr_type_t addr_type,
+                                  uint16_t appearance,
+                                  uint8_t* name,
+                                  uint8_t name_len,
+                                  int rssi)
+{
+    if (bt_scan_result_find(bda, bt_ble_scan_results))
+    {
+        ESP_LOGW(bt_tag, "Result already exists!");
+        return;
+    }
+
+    bt_hid_scan_result_t* r = (bt_hid_scan_result_t*)malloc(sizeof(bt_hid_scan_result_t));
+    if (r == NULL)
+    {
+        ESP_LOGE(bt_tag, "Malloc scan result failed!");
+        return;
+    }
+
+    r->next      = NULL;
+    r->name      = NULL;
+    r->rssi      = (int8_t)rssi;
+    r->transport = ESP_HID_TRANSPORT_BLE;
+    r->usage     = esp_hid_usage_from_appearance(appearance);
+
+    memcpy(r->bda, bda, sizeof(esp_bd_addr_t));
+    r->ble.appearance = appearance;
+    r->ble.addr_type  = addr_type;
+
+    if (name_len && name)
+    {
+        char* name_s = (char*)malloc((size_t)name_len + 1U);
+        if (name_s == NULL)
+        {
+            free(r);
+            ESP_LOGE(bt_tag, "Malloc result name failed!");
+            return;
+        }
+
+        memcpy(name_s, name, name_len);
+        name_s[name_len] = 0;
+        r->name = (const char*)name_s;
+    }
+
+    r->next = bt_ble_scan_results;
+    bt_ble_scan_results = r;
+    bt_num_ble_scan_results++;
+}
+
+static void bt_ble_task_demo(void* pv_parameters)
 {
     uint16_t direction = 0;
+
+    (void)pv_parameters;
 
     while (1)
     {
         switch (direction)
         {
-        case 0: /* Up. */
-            send_mouse(0, 0, 0xF6, 0);
-            break;
-        case 1: /* Right. */
-            send_mouse(0, 0x0A, 0, 0);
-            break;
-        case 2: /* Down. */
-            send_mouse(0, 0, 0x0A, 0);
-            break;
-        case 3: /* Left. */
-            send_mouse(0, 0xF6, 0, 0);
-            break;
+            case 0:
+                bt_mouse_send(0, 0, (char)0xF6, 0);
+                break;
+
+            case 1:
+                bt_mouse_send(0, (char)0x0A, 0, 0);
+                break;
+
+            case 2:
+                bt_mouse_send(0, 0, (char)0x0A, 0);
+                break;
+
+            case 3:
+                bt_mouse_send(0, (char)0xF6, 0, 0);
+                break;
+
+            default:
+                break;
         }
 
-        /* Wait 10 second. */
-        vTaskDelay(10000 / portTICK_PERIOD_MS);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-        /* Move to the next direction. */
-        direction = (direction + 1) % 4;
+        direction = (uint16_t)((direction + 1U) % 4U);
     }
 }
 
-static void ble_hid_task_start_up(void)
+static void bt_ble_task_start(void)
 {
-    xTaskCreate(ble_hid_demo_task, "ble_hid_demo_task", 2 * 1024, NULL, configMAX_PRIORITIES - 3,
-                &bt_ble_hid_param.task_hdl);
+    xTaskCreate(
+        bt_ble_task_demo,
+        "bt_ble_task_demo",
+        2 * 1024,
+        NULL,
+        configMAX_PRIORITIES - 3,
+        &bt_ble_hid_param.task_hdl
+    );
 }
 
-static void ble_hid_task_shut_down(void)
+static void bt_ble_task_stop(void)
 {
-    if (bt_ble_hid_param.task_hdl) {
+    if (bt_ble_hid_param.task_hdl)
+    {
         vTaskDelete(bt_ble_hid_param.task_hdl);
         bt_ble_hid_param.task_hdl = NULL;
     }
 }
 
-static void bt_ble_hidd_event_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
+static void bt_device_result_handle(struct ble_scan_result_evt_param* scan_rst)
 {
-    esp_hidd_event_t event = (esp_hidd_event_t)id;
-    esp_hidd_event_data_t *param = (esp_hidd_event_data_t *)event_data;
-    static const char *TAG = "HID_DEV_BLE";
+    uint16_t uuid = 0;
+    uint16_t appearance = 0;
+    char     name[64] = {0};
 
-    switch (event) {
-    case ESP_HIDD_START_EVENT: {
-        ESP_LOGI(TAG, "START");
-        esp_hid_ble_gap_adv_start();
-        break;
+    uint8_t  uuid_len = 0;
+    uint8_t* uuid_d = esp_ble_resolve_adv_data(scan_rst->ble_adv, ESP_BLE_AD_TYPE_16SRV_CMPL, &uuid_len);
+    if (uuid_d != NULL && uuid_len)
+    {
+        uuid = (uint16_t)(uuid_d[0] + (uuid_d[1] << 8));
     }
-    case ESP_HIDD_CONNECT_EVENT: {
-        ESP_LOGI(TAG, "CONNECT");
-        ble_hid_task_start_up();//todo: this should be on auth_complete (in GAP)
-        led_raw_set(LED_COLOR_GREEN, 1);
-        break;
+
+    uint8_t  appearance_len = 0;
+    uint8_t* appearance_d = esp_ble_resolve_adv_data(scan_rst->ble_adv, ESP_BLE_AD_TYPE_APPEARANCE, &appearance_len);
+    if (appearance_d != NULL && appearance_len)
+    {
+        appearance = (uint16_t)(appearance_d[0] + (appearance_d[1] << 8));
     }
-    case ESP_HIDD_PROTOCOL_MODE_EVENT: {
-        ESP_LOGI(TAG, "PROTOCOL MODE[%u]: %s", param->protocol_mode.map_index, param->protocol_mode.protocol_mode ? "REPORT" : "BOOT");
-        break;
+
+    uint8_t  adv_name_len = 0;
+    uint8_t* adv_name = esp_ble_resolve_adv_data(scan_rst->ble_adv, ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
+
+    if (adv_name == NULL)
+    {
+        adv_name = esp_ble_resolve_adv_data(scan_rst->ble_adv, ESP_BLE_AD_TYPE_NAME_SHORT, &adv_name_len);
     }
-    case ESP_HIDD_CONTROL_EVENT: {
-        ESP_LOGI(TAG, "CONTROL[%u]: %sSUSPEND", param->control.map_index, param->control.control ? "EXIT_" : "");
-        break;
+
+    if (adv_name != NULL && adv_name_len)
+    {
+        memcpy(name, adv_name, adv_name_len);
+        name[adv_name_len] = 0;
     }
-    case ESP_HIDD_OUTPUT_EVENT: {
-        ESP_LOGI(TAG, "OUTPUT[%u]: %8s ID: %2u, Len: %d, Data:", param->output.map_index, esp_hid_usage_str(param->output.usage), param->output.report_id, param->output.length);
-        ESP_LOG_BUFFER_HEX(TAG, param->output.data, param->output.length);
-        break;
+
+    GAP_DBG_PRINTF("BLE: " ESP_BD_ADDR_STR ", ", ESP_BD_ADDR_HEX(scan_rst->bda));
+    GAP_DBG_PRINTF("RSSI: %d, ", scan_rst->rssi);
+    GAP_DBG_PRINTF("UUID: 0x%04x, ", uuid);
+    GAP_DBG_PRINTF("APPEARANCE: 0x%04x, ", appearance);
+
+    if (adv_name_len)
+    {
+        GAP_DBG_PRINTF(", NAME: '%s'", name);
     }
-    case ESP_HIDD_FEATURE_EVENT: {
-        ESP_LOGI(TAG, "FEATURE[%u]: %8s ID: %2u, Len: %d, Data:", param->feature.map_index, esp_hid_usage_str(param->feature.usage), param->feature.report_id, param->feature.length);
-        ESP_LOG_BUFFER_HEX(TAG, param->feature.data, param->feature.length);
-        break;
+
+    GAP_DBG_PRINTF("\n");
+
+    if (uuid == ESP_GATT_UUID_HID_SVC)
+    {
+        bt_ble_scan_result_add(
+            scan_rst->bda,
+            scan_rst->ble_addr_type,
+            appearance,
+            adv_name,
+            adv_name_len,
+            scan_rst->rssi
+        );
     }
-    case ESP_HIDD_DISCONNECT_EVENT: {
-        ESP_LOGI(TAG, "DISCONNECT: %s", esp_hid_disconnect_reason_str(esp_hidd_dev_transport_get(param->disconnect.dev), param->disconnect.reason));
-        ble_hid_task_shut_down();
-        esp_hid_ble_gap_adv_start();
-        led_raw_set(LED_COLOR_GREEN, 0);
-        break;
+}
+
+static void bt_hidd_event_callback(void* handler_args, esp_event_base_t base, int32_t id, void* event_data)
+{
+    esp_hidd_event_t       event = (esp_hidd_event_t)id;
+    esp_hidd_event_data_t* param = (esp_hidd_event_data_t*)event_data;
+    static const char*     tag   = "HID_DEV_BLE";
+
+    (void)handler_args;
+    (void)base;
+    (void)param;
+
+    switch (event)
+    {
+        case ESP_HIDD_START_EVENT:
+        {
+            ESP_LOGI(tag, "START");
+            bt_ble_adv_start();
+            break;
+        }
+
+        case ESP_HIDD_CONNECT_EVENT:
+        {
+            ESP_LOGI(tag, "CONNECT");
+            bt_ble_task_start();
+            led_raw_set(LED_COLOR_GREEN, 1);
+            break;
+        }
+
+        case ESP_HIDD_DISCONNECT_EVENT:
+        {
+            ESP_LOGI(
+                tag,
+                "DISCONNECT: %s",
+                esp_hid_disconnect_reason_str(
+                    esp_hidd_dev_transport_get(((esp_hidd_event_data_t*)event_data)->disconnect.dev),
+                    ((esp_hidd_event_data_t*)event_data)->disconnect.reason
+                )
+            );
+            bt_ble_task_stop();
+            bt_ble_adv_start();
+            led_raw_set(LED_COLOR_GREEN, 0);
+            break;
+        }
+
+        case ESP_HIDD_STOP_EVENT:
+        {
+            ESP_LOGI(tag, "STOP");
+            led_raw_set(LED_COLOR_GREEN, 0);
+            break;
+        }
+
+        default:
+            break;
     }
-    case ESP_HIDD_STOP_EVENT: {
-        ESP_LOGI(TAG, "STOP");
-        led_raw_set(LED_COLOR_GREEN, 0);
-        break;
+}
+
+static esp_err_t bt_low_level_init(uint8_t mode)
+{
+    esp_err_t ret;
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+
+#if CONFIG_IDF_TARGET_ESP32
+    bt_cfg.mode = mode;
+#endif
+
+    ret = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    if (ret)
+    {
+        ESP_LOGE(bt_tag, "esp_bt_controller_mem_release failed: %d", ret);
+        return ret;
     }
-    default:
-        break;
+
+    ret = esp_bt_controller_init(&bt_cfg);
+    if (ret)
+    {
+        ESP_LOGE(bt_tag, "esp_bt_controller_init failed: %d", ret);
+        return ret;
     }
-    return;
+
+    ret = esp_bt_controller_enable(mode);
+    if (ret)
+    {
+        ESP_LOGE(bt_tag, "esp_bt_controller_enable failed: %d", ret);
+        return ret;
+    }
+
+    ret = esp_bluedroid_init();
+    if (ret)
+    {
+        ESP_LOGE(bt_tag, "esp_bluedroid_init failed: %d", ret);
+        return ret;
+    }
+
+    ret = esp_bluedroid_enable();
+    if (ret)
+    {
+        ESP_LOGE(bt_tag, "esp_bluedroid_enable failed: %d", ret);
+        return ret;
+    }
+
+    ret = bt_ble_gap_init();
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+static void bt_mouse_send(uint8_t buttons, char dx, char dy, char wheel)
+{
+    static uint8_t bt_buffer[5] = {0};
+
+    bt_buffer[0] = buttons;
+    bt_buffer[1] = (uint8_t)dx;
+    bt_buffer[2] = (uint8_t)dy;
+    bt_buffer[3] = (uint8_t)wheel;
+    bt_buffer[4] = 0;
+
+    esp_hidd_dev_input_set(bt_ble_hid_param.hid_dev, 0, 1, bt_buffer, 5);
+}
+
+static bt_hid_scan_result_t* bt_scan_result_find(esp_bd_addr_t bda, bt_hid_scan_result_t* results)
+{
+    bt_hid_scan_result_t* r = results;
+
+    while (r)
+    {
+        if (memcmp(bda, r->bda, sizeof(esp_bd_addr_t)) == 0)
+        {
+            return r;
+        }
+        r = r->next;
+    }
+
+    return NULL;
+}
+
+static const char* bt_str_ble_key_type(esp_ble_key_type_t key_type)
+{
+    const char* key_str = NULL;
+
+    switch (key_type)
+    {
+        case ESP_LE_KEY_NONE:
+            key_str = "ESP_LE_KEY_NONE";
+            break;
+
+        case ESP_LE_KEY_PENC:
+            key_str = "ESP_LE_KEY_PENC";
+            break;
+
+        case ESP_LE_KEY_PID:
+            key_str = "ESP_LE_KEY_PID";
+            break;
+
+        case ESP_LE_KEY_PCSRK:
+            key_str = "ESP_LE_KEY_PCSRK";
+            break;
+
+        case ESP_LE_KEY_PLK:
+            key_str = "ESP_LE_KEY_PLK";
+            break;
+
+        case ESP_LE_KEY_LLK:
+            key_str = "ESP_LE_KEY_LLK";
+            break;
+
+        case ESP_LE_KEY_LENC:
+            key_str = "ESP_LE_KEY_LENC";
+            break;
+
+        case ESP_LE_KEY_LID:
+            key_str = "ESP_LE_KEY_LID";
+            break;
+
+        case ESP_LE_KEY_LCSRK:
+            key_str = "ESP_LE_KEY_LCSRK";
+            break;
+
+        default:
+            key_str = "INVALID BLE KEY TYPE";
+            break;
+    }
+
+    return key_str;
 }
 
 /*******************************************************************************
@@ -223,22 +778,43 @@ esp_err_t bt_init(void)
 {
     esp_err_t ret;
 
-    ret = esp_hid_gap_init(BT_MODE_BLE);
-
-    if (ESP_OK == ret)
+    bt_ble_hidh_cb_semaphore = xSemaphoreCreateBinary();
+    if (bt_ble_hidh_cb_semaphore == NULL)
     {
-        ret = esp_hid_ble_gap_adv_init(ESP_HID_APPEARANCE_MOUSE, bt_ble_hid_config.device_name);
+        ESP_LOGE(bt_tag, "xSemaphoreCreateBinary failed!");
+        return ESP_FAIL;
     }
 
-    if (ESP_OK == ret)
+    ret = bt_low_level_init(BT_MODE_BLE);
+    if (ret != ESP_OK)
     {
-        ret = esp_ble_gatts_register_callback(esp_hidd_gatts_event_handler);
+        vSemaphoreDelete(bt_ble_hidh_cb_semaphore);
+        bt_ble_hidh_cb_semaphore = NULL;
+        return ret;
     }
 
-    if (ESP_OK == ret)
+    ret = bt_ble_gap_adv_init(ESP_HID_APPEARANCE_MOUSE, bt_ble_hid_config.device_name);
+    if (ret != ESP_OK)
     {
-        ret = esp_hidd_dev_init(&bt_ble_hid_config, ESP_HID_TRANSPORT_BLE, bt_ble_hidd_event_callback, &bt_ble_hid_param.hid_dev);
+        return ret;
     }
 
-    return ret;
+    ret = esp_ble_gatts_register_callback(esp_hidd_gatts_event_handler);
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
+
+    ret = esp_hidd_dev_init(
+        &bt_ble_hid_config,
+        ESP_HID_TRANSPORT_BLE,
+        bt_hidd_event_callback,
+        &bt_ble_hid_param.hid_dev
+    );
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
+
+    return ESP_OK;
 }
