@@ -231,6 +231,10 @@
           "drill": 0.2
         },
         {
+          "diameter": 0.45,
+          "drill": 0.2
+        },
+        {
           "diameter": 0.6,
           "drill": 0.3
         }
@@ -468,6 +472,7 @@
       "single_global_label": "ignore",
       "unannotated": "error",
       "unconnected_wire_endpoint": "warning",
+      "undefined_netclass": "error",
       "unit_value_mismatch": "error",
       "unresolved_variable": "error",
       "wire_dangling": "error"
@@ -514,10 +519,10 @@
       "gencad": "",
       "idf": "",
       "netlist": "",
-      "plot": "",
+      "plot": "gerbers/",
       "pos_files": "",
       "specctra_dsn": "",
-      "step": "",
+      "step": "mouser-jiggler.step",
       "svg": "",
       "vrml": ""
     },
